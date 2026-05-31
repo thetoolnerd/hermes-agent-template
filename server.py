@@ -21,6 +21,13 @@ Once configured, / proxies to the Hermes dashboard. A small "← Setup" widget i
 injected into every proxied HTML response so users can always return to the wizard.
 """
 
+# PEP 563 lazy annotations: keeps function/parameter type hints as strings so
+# they're never evaluated at import. Avoids the startup DeprecationWarning from
+# annotating against websockets.WebSocketClientProtocol (renamed in websockets
+# >= 14), and is forward-compatible regardless of the installed websockets
+# version. Safe here — nothing in this module introspects annotations at runtime.
+from __future__ import annotations
+
 import asyncio
 import json
 import os
@@ -94,7 +101,6 @@ ENV_VARS = [
     ("NVIDIA_API_KEY",           "NVIDIA NIM",               "provider",  True),
     ("ARCEEAI_API_KEY",          "Arcee AI",                 "provider",  True),
     ("STEPFUN_API_KEY",          "Step Plan",                "provider",  True),
-    ("AI_GATEWAY_API_KEY",       "Vercel AI Gateway",        "provider",  True),
     ("GEMINI_API_KEY",           "Google AI Studio",         "provider",  True),
     ("NOVITA_API_KEY",           "NovitaAI",                 "provider",  True),
     ("FIREWORKS_API_KEY",        "Fireworks AI",             "provider",  True),
@@ -999,6 +1005,17 @@ async def api_config_reset(request: Request):
 
 
 # ── Pairing ───────────────────────────────────────────────────────────────────
+# Pending-request file format (hermes >= v0.15 / v2026.5.29.x, gateway/pairing.py):
+# each `{platform}-pending.json` entry is keyed by a random opaque `entry_id`
+# (secrets.token_hex), and the user-facing pairing code is stored only as a
+# salted hash ({hash, salt, user_id, user_name, created_at}) — the plaintext
+# code is never on disk. Our admin-approval flow is code-agnostic: the dashboard
+# is already cookie-authed, so we approve by moving an entry from pending →
+# approved keyed off that `entry_id` (round-tripped from the pending list as
+# `code`), reading `user_id`/`user_name` straight from the entry. We must NOT
+# uppercase that key — entry_ids are lowercase hex, and uppercasing them was
+# what silently broke approve/deny on the v0.15 upgrade. Older plaintext-keyed
+# entries still work here because we treat the key as an opaque handle.
 def _pjson(path: Path) -> dict:
     try:
         return json.loads(path.read_text()) if path.exists() else {}
@@ -1035,7 +1052,7 @@ async def api_pairing_approve(request: Request):
     if err := guard(request): return err
     try: body = await request.json()
     except Exception: return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-    platform, code = body.get("platform",""), body.get("code","").upper().strip()
+    platform, code = body.get("platform",""), body.get("code","").strip()
     if not platform or not code:
         return JSONResponse({"error": "platform and code required"}, status_code=400)
     pending_path = PAIRING_DIR / f"{platform}-pending.json"
@@ -1043,9 +1060,14 @@ async def api_pairing_approve(request: Request):
     if code not in pending:
         return JSONResponse({"error": "Code not found"}, status_code=404)
     entry = pending.pop(code)
+    user_id = (entry.get("user_id") or "").strip() if isinstance(entry, dict) else ""
+    if not user_id:
+        # Malformed/legacy entry without a user_id — leave it in pending (we
+        # haven't written the pop yet) rather than silently discarding it.
+        return JSONResponse({"error": "Pending entry has no user_id"}, status_code=422)
     _wjson(pending_path, pending)
     approved = _pjson(PAIRING_DIR / f"{platform}-approved.json")
-    approved[entry["user_id"]] = {"user_name": entry.get("user_name",""), "approved_at": time.time()}
+    approved[user_id] = {"user_name": entry.get("user_name",""), "approved_at": time.time()}
     _wjson(PAIRING_DIR / f"{platform}-approved.json", approved)
     return JSONResponse({"ok": True})
 
@@ -1054,7 +1076,7 @@ async def api_pairing_deny(request: Request):
     if err := guard(request): return err
     try: body = await request.json()
     except Exception: return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-    platform, code = body.get("platform",""), body.get("code","").upper().strip()
+    platform, code = body.get("platform",""), body.get("code","").strip()
     p = PAIRING_DIR / f"{platform}-pending.json"
     pending = _pjson(p)
     if code in pending:
@@ -1251,15 +1273,22 @@ async def lifespan(app):
 
 
 # ── WebSocket reverse proxy ──────────────────────────────────────────────────
-# The hermes dashboard exposes 4 WebSocket endpoints when started with --tui.
-# Three are opened by the browser SPA and need to flow through our reverse
-# proxy; the fourth (/api/pub) is opened only by the PTY child against
-# loopback and is intentionally NOT proxied — exposing it would let an
-# authed user spam events into channels.
+# The hermes dashboard exposes several WebSocket endpoints when started with
+# --tui. The browser SPA opens these and they must flow through our reverse
+# proxy. /api/pub is opened only by the PTY child against loopback and is
+# intentionally NOT proxied — exposing it would let an authed user spam events
+# into channels. It lives at /api/pub (not under /api/plugins/), so the plugin
+# prefix route below does not match it.
 #
-#   /api/pty     binary stream — embedded TUI keystrokes/output
-#   /api/ws      JSON-RPC      — gateway sidecar driving Chat metadata
-#   /api/events  text frames   — dashboard subscriber for /api/pub fan-out
+#   /api/pty                  binary stream — embedded TUI keystrokes/output
+#   /api/ws                   JSON-RPC      — gateway sidecar driving Chat metadata
+#   /api/events               text frames   — dashboard subscriber for /api/pub fan-out
+#   /api/plugins/<name>/...   plugin-contributed sockets. Mounted by hermes
+#                             under /api/plugins/<name>/ (web_server.
+#                             _mount_plugin_api_routes), e.g. kanban's
+#                             /api/plugins/kanban/events live task feed. Added
+#                             in v0.15 — without a proxy route Starlette 403s
+#                             the upgrade and the SPA retries in a tight loop.
 #
 # Auth model (matches the HTTP proxy):
 #   * Edge: our HMAC cookie via _is_authenticated. WebSocket inherits .cookies
@@ -1267,7 +1296,7 @@ async def lifespan(app):
 #   * Upstream: hermes's own ?token=<_SESSION_TOKEN> query param. The SPA
 #     fetches that token via /api/auth/session-token and includes it in the
 #     WS URL, so we just forward path + query verbatim.
-PROXIED_WS_PATHS = ("/api/pty", "/api/ws", "/api/events")
+PROXIED_WS_PATHS = ("/api/pty", "/api/ws", "/api/events", "/api/plugins/*")
 
 
 async def _ws_pump_client_to_upstream(
@@ -1430,10 +1459,15 @@ routes = [
     # relative to the catch-all HTTP `Route("/{path:path}", ...)` below
     # doesn't matter — but listing them as a group keeps the surface
     # area auditable. Only paths in PROXIED_WS_PATHS are forwarded;
-    # /api/pub is intentionally omitted.
+    # /api/pub is intentionally omitted (not under /api/plugins/, so the
+    # prefix route below does not match it).
     WebSocketRoute("/api/pty",                  ws_proxy),
     WebSocketRoute("/api/ws",                   ws_proxy),
     WebSocketRoute("/api/events",               ws_proxy),
+    # Plugin-contributed sockets, mounted by hermes under /api/plugins/<name>/
+    # (e.g. kanban's /api/plugins/kanban/events). Prefix-matched so new plugin
+    # WS endpoints in future hermes releases proxy without re-touching this list.
+    WebSocketRoute("/api/plugins/{path:path}",  ws_proxy),
 
     # Root: redirect to /setup if unconfigured, otherwise proxy the dashboard.
     Route("/",                                  route_root,          methods=ANY_METHOD),
